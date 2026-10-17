@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ourfetch"
+version = "1.0.0"
+description = "the fetch for every terminal — info next to your OS logo (or your image), typed fast"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "virat013S" }]
+keywords = ["fetch", "terminal", "system-info", "fastfetch", "neofetch", "cross-platform"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Terminals",
+]
+
+[project.urls]
+Homepage = "https://github.com/virat013S/ourfetch"
+Issues = "https://github.com/virat013S/ourfetch/issues"
+
+[project.scripts]
+ourfetch = "ourfetch.core:main"
+
+[tool.setuptools]
+packages = ["ourfetch"]

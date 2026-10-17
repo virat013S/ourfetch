@@ -1,0 +1,1388 @@
+"""ourfetch — the fetch for every terminal, every OS.
+
+System info next to the OS logo (or an image you set), typed out fast like
+someone showing off. It runs anywhere — linux, macOS, Windows — from any
+terminal you already use (kitty, alacritty, gnome-terminal, iterm2,
+windows terminal, plain cmd…):
+
+    ourfetch                  run it (typewriter animation on a tty)
+    ourfetch --no-anim        instant — for scripts
+    ourfetch --cols 44        wider logo
+    ourfetch --logo kali      force any of the 23 logos, whatever the OS
+    ourfetch logos            list every logo id
+    ourfetch set-image X.png  remember an image as the logo
+    ourfetch clear-image      back to the automatic OS logo
+
+vivo's terminal (the one that ships it inbuilt) uses the exact same code;
+this package is the portable home for everyone else.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+import zlib
+from pathlib import Path
+
+ACCENT = (134, 174, 246)
+DIM = (118, 125, 141)
+FG = (210, 214, 222)
+BG = (19, 19, 23)                      # vitro glass background — images blend in
+BLOCKS = [(220, 111, 120), (141, 207, 157), (226, 196, 130),
+          (131, 170, 240), (196, 156, 240), (123, 212, 210),
+          (168, 199, 255), (233, 237, 246)]
+
+DEFAULTS = {"image": "", "cols": 36, "anim": True, "speed": 2.0,
+            "line_delay": 12, "intro": True, "caret": True, "bg": ""}
+
+# Logos straight from fastfetch's collection (tokens $1/$2/$3 → brand colors).
+LOGOS = {
+    "arch": [
+        r"                  -`",
+        r"                 .o+`",
+        r"                `ooo/",
+        r"               `+oooo:",
+        r"              `+oooooo:",
+        r"              -+oooooo+:",
+        r"            `/:-:++oooo+:",
+        r"           `/++++/+++++++:",
+        r"          `/++++++++++++++:",
+        r"         `/+++o$2oooooooo$1oooo/`",
+        r"        ./$2ooosssso++osssssso$1+`",
+        r"$2       .oossssso-````/ossssss+`",
+        r"      -osssssso.      :ssssssso.",
+        r"     :osssssss/        osssso+++.",
+        r"    /ossssssss/        +ssssooo/-",
+        r"  `/ossssso+/:-        -:/+osssso+-",
+        r" `+sso+:-`                 `.-/+oso:",
+        r"`++:.                           `-/+/",
+        r".`                                 `/",
+    ],
+    "cachyos": [
+        r"           $3.$1-------------------------:",
+        r"          .$2+=$1========================.",
+        r"         :$2++$1===$2++===$1===============-       :$2++$1-",
+        r"        :$2*++$1====$2+++++==$1===========-        .==:",
+        r"       -$2*+++$1=====$2+***++=$1=========:",
+        r"      =$2*++++=$1=======------------:",
+        r"     =$2*+++++=$1====-                     $3...$1",
+        r"   .$2+*+++++$1=-===:                    .$2=+++=$1:",
+        r"  :$2++++$1=====-==:                     -***$2**$1+",
+        r" :$2++=$1=======-=.                      .=+**+$3.$1",
+        r".$2+$1==========-.                          $3.$1",
+        r" :$2+++++++$1====-                                $3.$1--==-$3.$1",
+        r"  :$2++$1==========.                             $3:$2+++++++$1$3:",
+        r"   $1.-===========.                            =*****+*+",
+        r"    $1.-===========:                           .+*****+:",
+        r"      $1-=======$2++++$1:::::::::::::::::::::::::-:  $3.$1---:",
+        r"       :======$2++++$1====$2+++******************=.",
+        r"        $1:=====$2+++$1==========$2++++++++++++++*-",
+        r"         $1.====$2++$1==============$2++++++++++*-",
+        r"          $1.===$2+$1==================$2+++++++:",
+        r"           $1.-=======================$2+++:",
+        r"             $3..........................",
+    ],
+    "ubuntu": [
+        '                             ....',
+        "              $2.',:clooo:  $1.:looooo:.",
+        "           $2.;looooooooc  $1.oooooooooo'",
+        "        $2.;looooool:,''.  $1:ooooooooooc",
+        "       $2;looool;.         $1'oooooooooo,",
+        "      $2;clool'             $1.cooooooc.  $2,,",
+        '         $2...                $1......  $2.:oo,',
+        "  $1.;clol:,.                        $2.loooo'",
+        " $1:ooooooooo,                        $2'ooool",
+        "$1'ooooooooooo.                        $2loooo.",
+        "$1'ooooooooool                         $2coooo.",
+        ' $1,loooooooc.                        $2.loooo.',
+        "   $1.,;;;'.                          $2;ooooc",
+        '       $2...                         $2,ooool.',
+        "    $2.cooooc.              $1..',,'.  $2.cooo.",
+        '      $2;ooooo:.           $1;oooooooc.  $2:l.',
+        '       $2.coooooc,..      $1coooooooooo.',
+        "         $2.:ooooooolc:. $1.ooooooooooo'",
+        "           $2.':loooooo;  $1,oooooooooc",
+        "               $2..';::c'  $1.;loooo:'",
+    ],
+    "debian": [
+        '        $2_,met$$$$$$$$$$gg.',
+        '     ,g$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$P.',
+        '   ,g$$$$P""       """Y$$$$.".',
+        "  ,$$$$P'              `$$$$$$.",
+        "',$$$$P       ,ggs.     `$$$$b:",
+        '`d$$$$\'     ,$P"\'   $1.$2    $$$$$$',
+        " $$$$P      d$'     $1,$2    $$$$P",
+        " $$$$:      $$$.   $1-$2    ,d$$$$'",
+        " $$$$;      Y$b._   _,d$P'",
+        ' Y$$$$.    $1`.$2`"Y$$$$$$$$P"\'',
+        ' `$$$$b      $1"-.__',
+        '  $2`Y$$$$b',
+        '   `Y$$$$.',
+        '     `$$$$b.',
+        '       `Y$$$$b.',
+        '         `"Y$$b._',
+        '             `""""',
+    ],
+    "fedora": [
+        "             .',;::::;,'.",
+        "         .';:cccccccccccc:;,.",
+        '      .;cccccccccccccccccccccc;.',
+        '    .:cccccccccccccccccccccccccc:.',
+        '  .;ccccccccccccc;$2.:dddl:.$1;ccccccc;.',
+        ' .:ccccccccccccc;$2OWMKOOXMWd$1;ccccccc:.',
+        '.:ccccccccccccc;$2KMMc$1;cc;$2xMMc$1;ccccccc:.',
+        ',cccccccccccccc;$2MMM.$1;cc;$2;WW:$1;cccccccc,',
+        ':cccccccccccccc;$2MMM.$1;cccccccccccccccc:',
+        ':ccccccc;$2oxOOOo$1;$2MMM000k.$1;cccccccccccc:',
+        'cccccc;$20MMKxdd:$1;$2MMMkddc.$1;cccccccccccc;',
+        "ccccc;$2XMO'$1;cccc;$2MMM.$1;cccccccccccccccc'",
+        'ccccc;$2MMo$1;ccccc;$2MMW.$1;ccccccccccccccc;',
+        'ccccc;$20MNc.$1ccc$2.xMMd$1;ccccccccccccccc;',
+        'cccccc;$2dNMWXXXWM0:$1;cccccccccccccc:,',
+        'cccccccc;$2.:odl:.$1;cccccccccccccc:,.',
+        "ccccccccccccccccccccccccccccc:'.",
+        ':ccccccccccccccccccccccc:;,..',
+        " ':cccccccccccccccc::;,.",
+    ],
+    "manjaro": [
+        '██████████████████  ████████',
+        '██████████████████  ████████',
+        '██████████████████  ████████',
+        '██████████████████  ████████',
+        '████████            ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+        '████████  ████████  ████████',
+    ],
+    "linuxmint": [
+        '            $2_.-ppOOOOOOqq-._',
+        '         .oOOOOPPPPPPPPPPOOOOo.',
+        '      .oOOOO$1.=oOOOOOOOOOOo=.$2OOOOo.',
+        '    .:OOO$1.=oOOOOOOOOOOOOOOOOo=.$2OOO:.',
+        '   .OOO$1.OOOOOOOOOOOOOOOOOOOOOOOO.$2OOO.',
+        '  .OOO$1.OO    OOO:´   `::´    `:OOO.$2OO:',
+        ' .OOO$1.OOO    OO                OOO.$2OOO:',
+        ' OOO$1.OOOO    OO    oo    oo    OOOO.$2OOO',
+        ':OOO$1:OOOO    OO    OO    OO    OOOO:$2OOO:',
+        ':OOO$1:OOOO    OO    OO    OO    OOOO:$2OOO:',
+        "'OOO$1'OOOO    OO    OO    OO    OOOO'$2OOO'",
+        " OOO$1'OOOO    OO____OO____OO    OOOO'$2OOO'",
+        " 'OOO$1'OOO    'OOOOOOOOOOOO'    OOOO'$2OOO",
+        "  'OOO$1'OOO                    .OOO'$2OOO'",
+        "   'OOO$1'OOOO:ooooooooooooooo:OOOO'$2OOO'",
+        "    ':OOOo$1'=OOOOOOOOOOOOOOOOO='$2oOOO:'",
+        "      ':OOOOo$1'=OOOOOOOOOOO='$2oOOOO:'",
+        '         ``-OOOOooooooooooOOOO-´´',
+        '             ```-=:OOOO:=-´´´',
+    ],
+    "endeavouros": [
+        '                     $2./$1o$3.',
+        '                   $2./$1sssso$3-',
+        '                 $2`:$1osssssss+$3-',
+        '               $2`:+$1sssssssssso$3/.',
+        '             $2`-/o$1ssssssssssssso$3/.',
+        '           $2`-/+$1sssssssssssssssso$3+:`',
+        '         $2`-:/+$1sssssssssssssssssso$3+/.',
+        '       $2`.://o$1sssssssssssssssssssso$3++-',
+        '      $2.://+$1ssssssssssssssssssssssso$3++:',
+        '    $2.:///o$1ssssssssssssssssssssssssso$3++:',
+        '  $2`:////$1ssssssssssssssssssssssssssso$3+++.',
+        '$2`-////+$1ssssssssssssssssssssssssssso$3++++-',
+        ' $2`..-+$1oosssssssssssssssssssssssso$3+++++/`',
+        '   $3./++++++++++++++++++++++++++++++/:.',
+        '  `:::::::::::::::::::::::::------``',
+    ],
+    "pop": [
+        '             /////////////',
+        '         /////////////////////',
+        '      ///////$2*767$1////////////////',
+        '    //////$27676767676*$1//////////////',
+        '   /////$276767$1//$27676767$1//////////////',
+        '  /////$2767676$1///$2*76767$1///////////////',
+        ' ///////$2767676$1///$276767$1.///$27676*$1///////',
+        '/////////$2767676$1//$276767$1///$2767676$1////////',
+        '//////////$276767676767$1////$276767$1/////////',
+        '///////////$276767676$1//////$27676$1//////////',
+        '////////////,$27676$1,///////$2767$1///////////',
+        '/////////////*$27676$1///////$276$1////////////',
+        '///////////////$27676$1////////////////////',
+        ' ///////////////$27676$1///$2767$1////////////',
+        "  //////////////////////$2'$1////////////",
+        '   //////$2.7676767676767676767,$1//////',
+        '    /////$2767676767676767676767$1/////',
+        '      ///////////////////////////',
+        '         /////////////////////',
+        '             /////////////',
+    ],
+    "nixos": [
+        '          $1▗▄▄▄       $2▗▄▄▄▄    ▄▄▄▖',
+        '          $1▜███▙       $2▜███▙  ▟███▛',
+        '           $1▜███▙       $2▜███▙▟███▛',
+        '            $1▜███▙       $2▜██████▛',
+        '     $1▟█████████████████▙ $2▜████▛     $3▟▙',
+        '    $1▟███████████████████▙ $2▜███▙    $3▟██▙',
+        '           $6▄▄▄▄▖           $2▜███▙  $3▟███▛',
+        '          $6▟███▛             $2▜██▛ $3▟███▛',
+        '         $6▟███▛               $2▜▛ $3▟███▛',
+        '$6▟███████████▛                  $3▟██████████▙',
+        '$6▜██████████▛                  $3▟███████████▛',
+        '      $6▟███▛ $5▟▙               $3▟███▛',
+        '     $6▟███▛ $5▟██▙             $3▟███▛',
+        '    $6▟███▛  $5▜███▙           $3▝▀▀▀▀',
+        '    $6▜██▛    $5▜███▙ $4▜██████████████████▛',
+        '     $6▜▛     $5▟████▙ $4▜████████████████▛',
+        '           $5▟██████▙         $4▜███▙',
+        '          $5▟███▛▜███▙         $4▜███▙',
+        '         $5▟███▛  ▜███▙         $4▜███▙',
+        '         $5▝▀▀▀    ▀▀▀▀▘         $4▀▀▀▘',
+    ],
+    "gentoo": [
+        '         -/oyddmdhs+:.',
+        '     -o$2dNMMMMMMMMNNmhy+$1-`',
+        '   -y$2NMMMMMMMMMMMNNNmmdhy$1+-',
+        ' `o$2mMMMMMMMMMMMMNmdmmmmddhhy$1/`',
+        ' om$2MMMMMMMMMMMN$1hhyyyo$2hmdddhhhd$1o`',
+        '.y$2dMMMMMMMMMMd$1hs++so/s$2mdddhhhhdm$1+`',
+        ' oy$2hdmNMMMMMMMN$1dyooy$2dmddddhhhhyhN$1d.',
+        '  :o$2yhhdNNMMMMMMMNNNmmdddhhhhhyym$1Mh',
+        '    .:$2+sydNMMMMMNNNmmmdddhhhhhhmM$1my',
+        '       /m$2MMMMMMNNNmmmdddhhhhhmMNh$1s:',
+        '    `o$2NMMMMMMMNNNmmmddddhhdmMNhs$1+`',
+        '  `s$2NMMMMMMMMNNNmmmdddddmNMmhs$1/.',
+        ' /N$2MMMMMMMMNNNNmmmdddmNMNdso$1:`',
+        '+M$2MMMMMMNNNNNmmmmdmNMNdso$1/-',
+        'yM$2MNNNNNNNmmmmmNNMmhs+/$1-`',
+        '/h$2MMNNNNNNNNMNdhs++/$1-`',
+        '`/$2ohdmmddhys+++/:$1.`',
+        '  `-//////:--.',
+    ],
+    "opensuse": [
+        '           $2.;ldkO0000Okdl;.',
+        "       .;d00xl:^''''''^:ok00d;.",
+        "     .d00l'                'o00d.",
+        "   .d0Kd'$1  Okxol:;,.          $2:O0d",
+        '  .OK$1KKK0kOKKKKKKKKKKOxo:,      $2lKO.',
+        ' ,0K$1KKKKKKKKKKKKKKK0P^$2,,,$1^dx:$2    ;00,',
+        ".OK$1KKKKKKKKKKKKKKKk'$2.oOPPb.$1'0k.$2   cKO.",
+        ":KK$1KKKKKKKKKKKKKKK: $2kKx..dd $1lKd$2   'OK:",
+        "dKK$1KKKKKKKKKOx0KKKd $2^0KKKO' $1kKKc$2   dKd",
+        'dKK$1KKKKKKKKKK;.;oOKx,..$2^$1..;kKKK0.$2  dKd',
+        ":KK$1KKKKKKKKKK0o;...^cdxxOK0O/^^'  $2.0K:",
+        ' kKK$1KKKKKKKKKKKKK0x;,,......,;od  $2lKk',
+        " '0K$1KKKKKKKKKKKKKKKKKKKK00KKOo^  $2c00'",
+        "  'kK$1KKOxddxkOO00000Okxoc;''   $2.dKk'",
+        "    l0Ko.                    .c00l'",
+        "     'l0Kk:.              .;xK0l'",
+        "        'lkK0xl:;,,,,;:ldO0kl'",
+        "            '^:ldxkkkkxdl:^'",
+    ],
+    "garuda": [
+        '                   .%;888:8898898:',
+        '                 x;XxXB%89b8:b8%b88:',
+        '              .8Xxd                8X:.',
+        '            .8Xx;                    8x:.',
+        '          .tt8x          .d            x88;',
+        '       .@8x8;          .db:              xx@;',
+        '     ,tSXX°          .bbbbbbbbbbbbbbbbbbbB8x@;',
+        '   .SXxx            bBBBBBBBBBBBBBBBBBBBbSBX8;',
+        ' ,888S                                     pd!',
+        '8X88/                                       q',
+        '8X88/',
+        'GBB.',
+        ' x%88        d888@8@X@X@X88X@@XX@@X@8@X.',
+        '   dxXd    dB8b8b8B8B08bB88b998888b88x.',
+        '    dxx8o                      .@@;.',
+        '      dx88                   .t@x.',
+        '        d:SS@8ba89aa67a853Sxxad.',
+        '          .d988999889889899dd.',
+    ],
+    "artix": [
+        "                   '",
+        "                  'o'",
+        "                 'ooo'",
+        "                'ooxoo'",
+        "               'ooxxxoo'",
+        "              'oookkxxoo'",
+        "             'oiioxkkxxoo'",
+        "            ':;:iiiioxxxoo'",
+        "               `'.;::ioxxoo'",
+        "          '-.      `':;jiooo'",
+        "         'oooio-..     `'i:io'",
+        "        'ooooxxxxoio:,.   `'-;'",
+        "       'ooooxxxxxkkxoooIi:-.  `'",
+        "      'ooooxxxxxkkkkxoiiiiiji'",
+        "     'ooooxxxxxkxxoiiii:'`     .i'",
+        "    'ooooxxxxxoi:::'`       .;ioxo'",
+        "   'ooooxooi::'`         .:iiixkxxo'",
+        "  'ooooi:'`                `'';ioxxo'",
+        " 'i:'`                          '':io'",
+        "'`                                   `'",
+    ],
+    "kali": [
+        '..............',
+        '            ..,;:ccc,.',
+        "          ......''';lxO.",
+        ".....''''..........,:ld;",
+        "           .';;;:::;,,.x,",
+        "      ..'''.            0Xxoc:,.  ...",
+        "  ....                ,ONkc;,;cokOdc',.",
+        " .                   OMo           ':$2dd$1o.",
+        '                    dMc               :OO;',
+        '                    0M.                 .:o.',
+        '                    ;Wd',
+        '                     ;XO,',
+        '                       ,d0Odlc;,..',
+        "                           ..',;:cdOOd::,.",
+        "                                    .:d;.':;.",
+        "                                       'd,  .'",
+        '                                         ;l   ..',
+        '                                          .o',
+        '                                            c',
+        "                                            .'",
+        '                                             .',
+    ],
+    "alpine": [
+        '       .hddddddddddddddddddddddh.',
+        '      :dddddddddddddddddddddddddd:',
+        '     /dddddddddddddddddddddddddddd/',
+        '    +dddddddddddddddddddddddddddddd+',
+        '  `sdddddddddddddddddddddddddddddddds`',
+        ' `ydddddddddddd++hdddddddddddddddddddy`',
+        '.hddddddddddd+`  `+ddddh:-sdddddddddddh.',
+        'hdddddddddd+`      `+y:    .sddddddddddh',
+        'ddddddddh+`   `//`   `.`     -sddddddddd',
+        'ddddddh+`   `/hddh/`   `:s-    -sddddddd',
+        'ddddh+`   `/+/dddddh/`   `+s-    -sddddd',
+        'ddd+`   `/o` :dddddddh/`   `oy-    .yddd',
+        'hdddyo+ohddyosdddddddddho+oydddy++ohdddh',
+        '.hddddddddddddddddddddddddddddddddddddh.',
+        ' `yddddddddddddddddddddddddddddddddddy`',
+        '  `sdddddddddddddddddddddddddddddddds`',
+        '    +dddddddddddddddddddddddddddddd+',
+        '     /dddddddddddddddddddddddddddd/',
+        '      :dddddddddddddddddddddddddd:',
+        '       .hddddddddddddddddddddddh.',
+    ],
+    "void": [
+        '                __.;=====;.__',
+        '            _.=+==++=++=+=+===;.',
+        '             -=+++=+===+=+=+++++=_',
+        '        .     -=:``     `--==+=++==.',
+        '       _vi,    `            --+=++++:',
+        '      .uvnvi.       _._       -==+==+.',
+        '     .vvnvnI`    .;==|==;.     :|=||=|.',
+        '$2+QmQQm$1pvvnv;$2 _yYsyQQWUUQQQm #QmQ#$1:$2QQQWUV$QQm.',
+        ' $2-QQWQW$1pvvo$2wZ?.wQQQE$1==<$2QWWQ/QWQW.QQWW$1(:$2 jQWQE',
+        "  $2-$QQQQmmU'  jQQQ$1@+=<$2QWQQ)mQQQ.mQQQC$1+;$2jWQQ@'",
+        '   $2-$WQ8Y$1nI:$2   QWQQwgQQWV$1`$2mWQQ.jQWQQgyyWW@!',
+        '     $1-1vvnvv.     `~+++`        ++|+++',
+        '      +vnvnnv,                 `-|===',
+        '       +vnvnvns.           .      :=-',
+        '        -Invnvvnsi..___..=sv=.     `',
+        '          +Invnvnvnnnnnnnnvvnn;.',
+        '            ~|Invnvnvvnvvvnnv}+`',
+        '               -~|{*l}*|~',
+    ],
+    "elementary": [
+        '         eeeeeeeeeeeeeeeee',
+        '      eeeeeeeeeeeeeeeeeeeeeee',
+        '    eeeee  eeeeeeeeeeee   eeeee',
+        '  eeee   eeeee       eee     eeee',
+        ' eeee   eeee          eee     eeee',
+        'eee    eee            eee       eee',
+        'eee   eee            eee        eee',
+        'ee    eee           eeee       eeee',
+        'ee    eee         eeeee      eeeeee',
+        'ee    eee       eeeee      eeeee ee',
+        'eee   eeee   eeeeee      eeeee  eee',
+        'eee    eeeeeeeeee     eeeeee    eee',
+        ' eeeeeeeeeeeeeeeeeeeeeeee    eeeee',
+        '  eeeeeeee eeeeeeeeeeee      eeee',
+        '    eeeee                 eeeee',
+        '      eeeeeee         eeeeeee',
+        '         eeeeeeeeeeeeeeeee',
+    ],
+    "linux": [
+        '        $2#####',
+        '       $2#######',
+        '       $2##$1O$2#$1O$2##',
+        '       $2#$3#####$2#',
+        '     $2##$1##$3###$1##$2##',
+        '    $2#$1##########$2##',
+        '   $2#$1############$2##',
+        '   $2#$1############$2###',
+        '  $3##$2#$1###########$2##$3#',
+        '$3######$2#$1#######$2#$3######',
+        '$3#######$2#$1#####$2#$3#######',
+        '  $3#####$2#######$3#####',
+    ],
+    "macos": [
+        "                     ..'",
+        '                 ,xNMM.',
+        '               .OMMMMo',
+        '               lMM"',
+        '     .;loddo:.  .olloddol;.',
+        '   cKMMMMMMMMMMNWMMMMMMMMMM0:',
+        ' $2.KMMMMMMMMMMMMMMMMMMMMMMMWd.',
+        ' XMMMMMMMMMMMMMMMMMMMMMMMX.',
+        '$3;MMMMMMMMMMMMMMMMMMMMMMMM:',
+        ':MMMMMMMMMMMMMMMMMMMMMMMM:',
+        '$4.MMMMMMMMMMMMMMMMMMMMMMMMX.',
+        ' kMMMMMMMMMMMMMMMMMMMMMMMMWd.',
+        " $5'XMMMMMMMMMMMMMMMMMMMMMMMMMMk",
+        "  'XMMMMMMMMMMMMMMMMMMMMMMMMK.",
+        '    $6kMMMMMMMMMMMMMMMMMMMMMMd',
+        '     ;KMMMMMMMWXXWMMMMMMMk.',
+        '       "cooc*"    "*coo\'"',
+    ],
+    "windows": [
+        '$1        ,.=:!!t3Z3z.,',
+        '       :tt:::tt333EE3',
+        '$1       Et:::ztt33EEEL$2 @Ee.,      ..,',
+        '$1      ;tt:::tt333EE7$2 ;EEEEEEttttt33#',
+        '$1     :Et:::zt333EEQ.$2 $EEEEEttttt33QL',
+        '$1     it::::tt333EEF$2 @EEEEEEttttt33F',
+        '$1    ;3=*^```"*4EEV$2 :EEEEEEttttt33@.',
+        '$3    ,.=::::!t=., $1`$2 @EEEEEEtttz33QF',
+        '$3   ;::::::::zt33)$2   "4EEEtttji3P*',
+        '$3  :t::::::::tt33.$4:Z3z..$2  ``$4 ,..g.',
+        '$3  i::::::::zt33F$4 AEEEtttt::::ztF',
+        '$3 ;:::::::::t33V$4 ;EEEttttt::::t3',
+        '$3 E::::::::zt33L$4 @EEEtttt::::z3F',
+        '$3{3=*^```"*4E3)$4 ;EEEtttt:::::tZ`',
+        '$3             `$4 :EEEEtttt::::z7',
+        '                 "VEzjt:;;z>*`',
+    ],
+    "freebsd": [
+        '```                        $2`',
+        '  $1` `.....---...$2....--.```   -/',
+        '  $1+o   .--`         $2/y:`      +.',
+        '   $1yo`:.            $2:o      `+-',
+        '    $1y/               $2-/`   -o/',
+        '   $1.-                  $2::/sy+:.',
+        '   $1/                     $2`--  /',
+        '  $1`:                          $2:`',
+        '  $1`:                          $2:`',
+        '   $1/                          $2/',
+        '   $1.-                        $2-.',
+        '    $1--                      $2-.',
+        '     $1`:`                  $2`:`',
+        '       .--             `--.',
+        '          .---.....----.',
+    ],
+    "generic": [
+        "     ▄▄▀▀▄     ",
+        "   ▄█▀▀  ▀▀█▄  ",
+        "  ▄█▀      ▀█▄ ",
+        " ▐█▌  ▄▄▄▄  ▐█▌",
+        "  ▀█▄▄▀▀▀▄▄█▀  ",
+        "   ▀█▄▄  ▄▄█▀  ",
+        "     ▀▀▄▄▀▀    ",
+    ],
+}
+
+# $1 = body, $2 = detail/outline, $3 = pale highlight — arch + cachyos keep
+# hand-tuned truecolors; the rest use fastfetch's own palettes (parsed from
+# their builtin logo definitions, ANSI codes → RGB).
+TOKEN_COLORS = {
+    "arch": {"1": (36, 145, 210), "2": (137, 201, 242), "3": (150, 165, 200)},
+    "cachyos": {"1": (76, 195, 189), "2": (150, 224, 217), "3": (219, 244, 242)},
+    "ubuntu": {"1": (205, 0, 0)},
+    "debian": {"1": (205, 0, 0), "2": (229, 229, 229)},
+    "fedora": {"1": (0, 0, 238), "2": (229, 229, 229)},
+    "manjaro": {"1": (0, 205, 0)},
+    "linuxmint": {"1": (0, 205, 0), "2": (229, 229, 229)},
+    "endeavouros": {"1": (205, 0, 205), "2": (205, 0, 0), "3": (0, 0, 238)},
+    "pop": {"1": (0, 205, 205), "2": (229, 229, 229)},
+    "nixos": {"1": (0, 0, 238), "2": (0, 205, 205), "3": (0, 0, 238),
+              "4": (0, 205, 205), "5": (0, 0, 238), "6": (0, 205, 205)},
+    "gentoo": {"1": (205, 0, 205), "2": (229, 229, 229)},
+    "opensuse": {"1": (0, 205, 0), "2": (229, 229, 229)},
+    "garuda": {"1": (205, 0, 0)},
+    "artix": {"1": (0, 205, 205)},
+    "kali": {"1": (0, 0, 238), "2": (127, 127, 127)},
+    "alpine": {"1": (0, 0, 238)},
+    "void": {"1": (0, 205, 0), "2": (127, 127, 127)},
+    "elementary": {"1": (150, 160, 190)},
+    "linux": {"1": (229, 229, 229), "2": (127, 127, 127), "3": (205, 205, 0)},
+    "macos": {"1": (229, 229, 229), "2": (0, 205, 0), "3": (205, 205, 0),
+              "4": (255, 0, 0), "5": (205, 0, 205), "6": (0, 0, 238)},
+    "windows": {"1": (205, 0, 0), "2": (0, 205, 0), "3": (0, 0, 238),
+                "4": (205, 205, 0)},
+    "freebsd": {"1": (229, 229, 229), "2": (205, 0, 0)},
+}
+
+
+# ------------------------------------------------------------------ config
+def config_dir() -> str:
+    # unix (linux + macOS) honors XDG; windows uses %APPDATA%\ourfetch
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "ourfetch")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ourfetch")
+
+
+def config_path() -> str:
+    return os.path.join(config_dir(), "fetch.json")
+
+
+def _adopt_vitro(merged: dict) -> bool:
+    """One-time: an existing vitro fetch setup becomes ours, unchanged.
+
+    Copy vitro's fetch.json (and any remembered image) into our own config
+    dir so upgrading to the standalone keeps every knob."""
+    if sys.platform == "win32":
+        return False
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    src_cfg = os.path.join(base, "vitro", "fetch.json")
+    try:
+        with open(src_cfg, encoding="utf-8") as f:
+            user = json.load(f)
+        if not isinstance(user, dict):
+            return False
+        raw = str(user.get("image") or "")
+        if raw:
+            img = Path(os.path.expanduser(raw))
+            if img.is_file():
+                os.makedirs(config_dir(), exist_ok=True)
+                dest = Path(config_dir()) / "image.png"
+                shutil.copyfile(img, dest)
+                user["image"] = str(dest)
+        for key in merged:
+            if key in user:
+                merged[key] = user[key]
+        return save_config(merged)
+    except Exception:
+        return False
+
+
+def load_config() -> dict:
+    merged = dict(DEFAULTS)
+    try:
+        with open(config_path(), encoding="utf-8") as f:
+            user = json.load(f)
+    except Exception:
+        _adopt_vitro(merged)                     # first run — migrate if possible
+        return merged
+    if isinstance(user, dict):
+        for key in DEFAULTS:
+            if key in user:
+                merged[key] = user[key]
+    return merged
+
+
+def save_config(values: dict) -> bool:
+    try:
+        os.makedirs(config_dir(), exist_ok=True)
+        tmp = config_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(values, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, config_path())
+        return True
+    except Exception:
+        return False
+
+
+def image_path() -> Path | None:
+    """The remembered logo image, or None (→ automatic OS logo)."""
+    cfg = load_config()
+    raw = str(cfg.get("image") or "").strip()
+    if not raw:
+        return None
+    p = Path(os.path.expanduser(raw))
+    return p if p.is_file() and p.stat().st_size > 0 else None
+
+
+# ------------------------------------------------------------------ info bits
+def _os_release() -> dict:
+    out: dict[str, str] = {}
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip().strip('"')
+    except Exception:
+        pass
+    return out
+
+
+def os_id() -> str:
+    rel = _os_release().get("ID", "").strip().lower()
+    if rel:
+        return rel
+    system = platform.system().lower()          # linux / darwin / windows
+    return {"darwin": "macos"}.get(system, system)
+
+
+def sys_name() -> str:
+    rel = _os_release()
+    if rel.get("PRETTY_NAME"):
+        return rel["PRETTY_NAME"]
+    try:
+        if sys.platform == "darwin":
+            return f"macOS {platform.mac_ver()[0]}"
+        if sys.platform == "win32":
+            ver, build = platform.win32_ver()[:2]
+            try:
+                n = int(build.split(".")[2])
+            except (ValueError, IndexError):
+                n = 0
+            return "Windows 11" if n >= 22000 else f"Windows {ver}"
+        return platform.system()
+    except Exception:
+        return platform.system() or "?"
+
+
+def kernel() -> str:
+    try:
+        return platform.release()
+    except Exception:
+        return ""
+
+
+def machine() -> str:
+    try:
+        return platform.machine()
+    except Exception:
+        return ""
+
+
+def user_host() -> str:
+    user = (os.environ.get("USER") or os.environ.get("LOGNAME")
+            or os.environ.get("USERNAME") or "")
+    try:
+        host = os.uname().nodename
+    except AttributeError:                       # windows has no os.uname
+        host = platform.uname().node
+    return f"{user}@{host}".strip("@")
+
+
+def shell_name() -> str:
+    s = os.environ.get("SHELL") or ""
+    if not s and sys.platform == "win32":
+        s = os.environ.get("ComSpec") or ""
+    if not s:
+        return ""
+    name = s.replace("\\", "/").rsplit("/", 1)[-1]
+    return name[:-4] if name.lower().endswith(".exe") else name
+
+
+def desktop() -> str:
+    for var in ("XDG_CURRENT_DESKTOP", "DESKTOP_SESSION"):
+        v = os.environ.get(var)
+        if v:
+            return v.split(":")[0].strip() or v
+    if sys.platform == "darwin":
+        return "aqua"
+    if sys.platform == "win32":
+        return "explorer"
+    return "tty" if not os.environ.get("WAYLAND_DISPLAY") else "wayland"
+
+
+def terminal_name() -> str:
+    tp = os.environ.get("TERM_PROGRAM")
+    if tp:
+        return tp
+    if sys.platform == "win32" and os.environ.get("WT_SESSION"):
+        return "windows-terminal"
+    t = os.environ.get("TERM") or ""
+    return "vt" if t in ("", "dumb") else t
+
+
+def cpu() -> str:
+    try:
+        if os.path.exists("/proc/cpuinfo"):
+            with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("model name") and ":" in line:
+                        return line.split(":", 1)[1].strip()
+        if sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                 capture_output=True, text=True, timeout=3)
+            return out.stdout.strip()
+        if sys.platform == "win32":
+            out = subprocess.run(["wmic", "cpu", "get", "name"],
+                                 capture_output=True, text=True, timeout=6)
+            lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+            if len(lines) >= 2:
+                return lines[1]
+            return platform.processor() or ""
+    except Exception:
+        pass
+    return ""
+
+
+def mem_str() -> str:
+    try:
+        if os.path.exists("/proc/meminfo"):
+            info = {}
+            with open("/proc/meminfo", encoding="ascii") as f:
+                for line in f:
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        info[k] = int(v.strip().split()[0])   # kB
+            total, avail = info.get("MemTotal"), info.get("MemAvailable")
+            if total and avail is not None:
+                used = total - avail
+                return f"{used / 2 ** 20:.1f} / {total / 2 ** 20:.1f} GiB"
+            return ""
+        if sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                 capture_output=True, text=True, timeout=3)
+            total = int(out.stdout.strip() or 0)
+            used, page = 0, 0
+            out2 = subprocess.run(["vm_stat"], capture_output=True,
+                                  text=True, timeout=4)
+            for line in out2.stdout.splitlines():
+                m = re.search(r"page size of (\d+)", line)
+                if m and not page:
+                    page = int(m.group(1))
+                m2 = re.search(r"Pages (active|wired down|occupied by "
+                               r"compressor): (\d+)", line)
+                if m2:
+                    used += int(m2.group(2))
+            if total and page and used:
+                return (f"{used * page / 2 ** 20:.1f}"
+                        f" / {total / 2 ** 20:.1f} GiB")
+            if total:
+                return f"{total / 2 ** 20:.1f} GiB total"
+            return ""
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("dwLength", wintypes.DWORD),
+                            ("dwMemoryLoad", wintypes.DWORD),
+                            ("ullTotalPhys", ctypes.c_uint64),
+                            ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64),
+                            ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64),
+                            ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+            st = MemoryStatus()
+            st.dwLength = ctypes.sizeof(MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                used = st.ullTotalPhys - st.ullAvailPhys
+                return (f"{used / 2 ** 20:.1f}"
+                        f" / {st.ullTotalPhys / 2 ** 20:.1f} GiB")
+    except Exception:
+        pass
+    return ""
+
+
+def disk_str() -> str:
+    try:
+        # shutil.disk_usage works from linux to Windows without /proc
+        st = shutil.disk_usage("/")
+        used, total = st.used, st.total
+        pct = (used / total * 100) if total else 0
+        return f"{used / 2 ** 30:.0f} / {total / 2 ** 30:.0f} GiB ({pct:.0f}%)"
+    except Exception:
+        return ""
+
+
+def uptime_str() -> str:
+    secs = 0.0
+    try:
+        if os.path.exists("/proc/uptime"):
+            with open("/proc/uptime", encoding="ascii") as f:
+                secs = float(f.read().split()[0])
+        elif sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                                 capture_output=True, text=True, timeout=3)
+            m = re.search(r"sec\s*=\s*(\d+)", out.stdout)
+            if m:
+                secs = time.time() - int(m.group(1))
+        elif sys.platform == "win32":
+            import ctypes
+            secs = ctypes.windll.kernel32.GetTickCount64() / 1000.0
+        else:
+            return ""
+        if secs <= 0:
+            return ""
+    except Exception:
+        return ""
+    d, r = divmod(int(secs), 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h or d:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return " ".join(parts)
+
+
+def packages() -> str:
+    def count(argv: list, label: str) -> str:
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True,
+                                 timeout=8)
+            if out.returncode == 0 and len(out.stdout.splitlines()) >= 1:
+                return f"{len(out.stdout.splitlines())} ({label})"
+        except Exception:
+            pass
+        return ""
+
+    for check, argv, label in (
+            ("pacman", ["pacman", "-Q"], "pacman"),
+            ("dpkg-query", ["dpkg-query", "-f", ".\n", "-W"], "dpkg"),
+            ("rpm", ["rpm", "-qa", "--quiet"], "rpm"),
+            ("apk", ["apk", "info"], "apk"),
+            ("brew", ["brew", "list", "--formula"], "brew"),
+    ):
+        if shutil.which(check):
+            got = count(argv, label)
+            if got:
+                return got
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-AppxPackage).Count + "
+                 "(Get-ItemProperty "
+                 "HKLM:/Software/Microsoft/Windows/CurrentVersion/Uninstall"
+                 "\\* 2>$null).Count"],
+                capture_output=True, text=True, timeout=25)
+            n = int(out.stdout.strip().split()[0])
+            return f"{n} (windows)"
+        except Exception:
+            pass
+    return ""
+
+
+def gather() -> list[tuple[str, str]]:
+    """Ordered (label, value) rows; empty values dropped by compose()."""
+    rows: list[tuple[str, str]] = []
+    if user_host():
+        rows.append(("user", user_host()))
+    rows.append(("os", sys_name()))
+    k = " ".join(x for x in (kernel(), machine()) if x)
+    if k:
+        rows.append(("kernel", k))
+    if shell_name():
+        rows.append(("shell", shell_name()))
+    rows.append(("wm", desktop()))
+    rows.append(("term", terminal_name()))
+    c = cpu()
+    if c:
+        rows.append(("cpu", c))
+    m = mem_str()
+    if m:
+        rows.append(("mem", m))
+    d = disk_str()
+    if d:
+        rows.append(("disk", d))
+    u = uptime_str()
+    if u:
+        rows.append(("uptime", u))
+    p = packages()
+    if p:
+        rows.append(("packages", p))
+    return rows
+
+
+# ----------------------------------------------------------------- png decode
+def _paeth(a: int, b: int, c: int) -> int:
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def _png_decode(data: bytes) -> tuple[int, int, list[tuple[int, int, int, int]]]:
+    """Minimal PNG: 8-bit, RGB/RGBA/gray/gray+alpha/palette, no interlace."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    pos, w, h, depth, ctype, plte, trns, idat = 8, 0, 0, 8, 6, b"", b"", []
+    while pos + 8 <= len(data):
+        (size,), tag = struct.unpack(">I", data[pos:pos + 4]), data[pos + 4:pos + 8]
+        body, pos = data[pos + 8:pos + 8 + size], pos + 8 + size + 4
+        if tag == b"IHDR":
+            w, h, depth, ctype = struct.unpack(">IIBB", body[:10])
+        elif tag == b"PLTE":
+            plte = body
+        elif tag == b"tRNS":
+            trns = body
+        elif tag == b"IDAT":
+            idat.append(body)
+        elif tag == b"IEND":
+            break
+    if not w or not h:
+        raise ValueError("no IHDR")
+    if depth != 8:
+        raise ValueError(f"bit depth {depth} unsupported (need 8)")
+    if ctype == 0:
+        bpp = 1
+    elif ctype == 2:
+        bpp = 3
+    elif ctype == 3:
+        bpp = 1
+    elif ctype == 4:
+        bpp = 2
+    elif ctype == 6:
+        bpp = 4
+    else:
+        raise ValueError(f"color type {ctype} unsupported")
+    raw = zlib.decompress(b"".join(idat))
+    stride = w * bpp
+    if len(raw) < h * (stride + 1):
+        raise ValueError("truncated PNG data")
+    rows = bytearray(h * stride)
+    prev = bytearray(stride)
+    pos = 0
+    for y in range(h):
+        f = raw[pos]
+        pos += 1
+        line = bytearray(raw[pos:pos + stride])
+        pos += stride
+        if f == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 0xFF
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 0xFF
+        elif f == 3:
+            for i in range(stride):
+                left = line[i - bpp] if i >= bpp else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - bpp] if i >= bpp else 0
+                c = prev[i - bpp] if i >= bpp else 0
+                line[i] = (line[i] + _paeth(a, prev[i], c)) & 0xFF
+        rows[y * stride:(y + 1) * stride] = line
+        prev = line
+
+    px: list[tuple[int, int, int, int]] = []
+    for i in range(w * h):
+        if ctype == 0:
+            v = rows[i]
+            px.append((v, v, v, 255))
+        elif ctype == 2:
+            px.append((rows[i * 3], rows[i * 3 + 1], rows[i * 3 + 2], 255))
+        elif ctype == 3:
+            idx = rows[i]
+            r = plte[idx * 3] if idx * 3 + 2 < len(plte) else 0
+            g = plte[idx * 3 + 1] if idx * 3 + 2 < len(plte) else 0
+            b = plte[idx * 3 + 2] if idx * 3 + 2 < len(plte) else 0
+            a = trns[idx] if idx < len(trns) else 255
+            px.append((r, g, b, a))
+        elif ctype == 4:
+            v, a = rows[i * 2], rows[i * 2 + 1]
+            px.append((v, v, v, a))
+        else:
+            px.append((rows[i * 4], rows[i * 4 + 1], rows[i * 4 + 2],
+                       rows[i * 4 + 3]))
+    return w, h, px
+
+
+def _load_rgba(path: str) -> tuple[int, int, list]:
+    p = Path(os.path.expanduser(path))
+    data = p.read_bytes()
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return _png_decode(data)
+    try:
+        from PIL import Image
+        im = Image.open(p).convert("RGBA")
+        return im.width, im.height, list(im.getdata())
+    except Exception:
+        raise ValueError("only PNG works without Pillow (pip install pillow "
+                         "for jpg/webp)")
+
+
+def _blend(c: tuple, bg: tuple, a: int) -> tuple:
+    t = a / 255.0
+    return tuple(int(c[i] * t + bg[i] * (1 - t)) for i in range(3))
+
+
+def image_to_ansi(path: str, cols: int = 36,
+                  bg: tuple = BG) -> list[str]:
+    """Image → upper-half-block truecolor lines (2 pixels per row)."""
+    cols = max(8, min(80, int(cols)))
+    w, h, px = _load_rgba(path)
+    comp = [_blend(px[i], bg, px[i][3]) for i in range(w * h)]
+
+    def sample(x0: int, x1: int, y0: int, y1: int) -> tuple:
+        xs, ys = max(0, x0), max(0, y0)
+        xe, ye = min(w, max(x1, xs + 1)), min(h, max(y1, ys + 1))
+        n = 0
+        acc = [0, 0, 0]
+        for y in range(ys, ye):
+            for x in range(xs, xe):
+                c = comp[y * w + x]
+                acc[0] += c[0]
+                acc[1] += c[1]
+                acc[2] += c[2]
+                n += 1
+        return (acc[0] // n, acc[1] // n, acc[2] // n) if n else bg
+
+    rows_n = max(1, round(h * (cols / w) / 2))
+    art: list[str] = []
+    for r in range(rows_n):
+        y0, y1 = round(r * h / rows_n), round((r + 1) * h / rows_n)
+        ym = (y0 + y1) // 2
+        line = []
+        for c_i in range(cols):
+            x0, x1 = round(c_i * w / cols), round((c_i + 1) * w / cols)
+            top = sample(x0, x1, y0, ym)
+            bot = sample(x0, x1, ym, y1)
+            line.append(f"\x1b[38;2;{top[0]};{top[1]};{top[2]}m"
+                        f"\x1b[48;2;{bot[0]};{bot[1]};{bot[2]}m▀")
+        art.append("".join(line) + "\x1b[0m")
+    return art
+
+
+# ---------------------------------------------------------------------- logo
+TOKEN_RE = re.compile(r"\$(\d)")
+
+
+def _token_colored(lines: list[str], colors: dict) -> list[str]:
+    """fastfetch token lines ($1/$2/$3) → truecolor lines."""
+    out = []
+    for raw in lines:
+        buf: list[str] = []
+        cur = colors.get("1") or FG
+        last: tuple | None = None
+        segs = TOKEN_RE.split(raw)
+        for j, seg in enumerate(segs):
+            if j % 2 == 1:                 # capture: the token number
+                cur = colors.get(seg) or colors.get("1") or FG
+                continue
+            if not seg:
+                continue
+            if cur != last:
+                buf.append(f"\x1b[38;2;{cur[0]};{cur[1]};{cur[2]}m")
+                last = cur
+            buf.append(seg)
+        buf.append("\x1b[0m")
+        out.append("".join(buf))
+    return out
+
+
+def _logo_key(os_id: str) -> str:
+    """os-release spikes: opensuse-tumbleweed → opensuse, ubuntu-mate → ubuntu."""
+    if os_id in LOGOS:
+        return os_id
+    head = re.split(r"[-_]", os_id, maxsplit=1)[0]
+    return head if head in LOGOS else "generic"
+
+
+def brand_color(os_id: str) -> tuple:
+    """Body color of the logo — labels dress in it too."""
+    return TOKEN_COLORS.get(_logo_key(os_id), {}).get("1", ACCENT)
+
+
+def logo_for(os_id: str) -> list[str]:
+    """The fastfetch logo for the running OS; vitro's shard for unknowns."""
+    key = _logo_key(os_id)
+    raw = LOGOS[key]
+    if any("$" in line for line in raw):
+        return _token_colored(raw, TOKEN_COLORS[key])
+    out = []
+    n = len(raw)
+    base = TOKEN_COLORS.get(key, {}).get("1", (150, 165, 200))
+    for i, line in enumerate(raw):
+        t = i / max(1, n - 1)          # fade logo base → foreground
+        col = tuple(int(base[k] + (FG[k] - base[k]) * t) for k in range(3))
+        out.append(f"\x1b[38;2;{col[0]};{col[1]};{col[2]}m{line}\x1b[0m")
+    return out
+
+
+# ------------------------------------------------------------------- compose
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def visible_len(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
+
+
+def info_lines(rows: list[tuple[str, str]], color: bool = True,
+               brand: tuple = ACCENT) -> list[str]:
+    out = []
+    width = max((len(label) for label, _ in rows), default=6)
+    for label, value in rows:
+        if not value:
+            continue
+        if color:
+            out.append(f"\x1b[1m\x1b[38;2;{brand[0]};{brand[1]};{brand[2]}m"
+                       f"{label.rjust(width)}\x1b[0m"
+                       f"\x1b[38;2;{DIM[0]};{DIM[1]};{DIM[2]}m · \x1b[0m"
+                       f"\x1b[38;2;{FG[0]};{FG[1]};{FG[2]}m{value}\x1b[0m")
+        else:
+            out.append(f"{label.rjust(width)} · {value}")
+    return out
+
+
+def colors_line(color: bool = True) -> str:
+    if not color:
+        return ""
+    return "".join(f"\x1b[38;2;{c[0]};{c[1]};{c[2]}m███\x1b[0m"
+                   for c in BLOCKS)
+
+
+def compose(art: list[str], info: list[str], colors: str,
+            color: bool = True) -> str:
+    aw = max((visible_len(line) for line in art), default=0) + 3
+    rows = max(len(art), len(info) + (2 if colors else 0))
+    out = []
+    for i in range(rows):
+        line = art[i] if i < len(art) else ""
+        pad = " " * (aw - visible_len(line)) if line else " " * aw
+        text = ""
+        if i < len(info):
+            text = info[i]
+        elif colors and i == len(info):
+            text = colors
+        out.append(f"{line}{pad}{text}\x1b[0m")
+    return "\n".join(out) + "\n"
+
+
+# ------------------------------------------------------------- typing effect
+# ------------------------------------------------------- the flying bar
+# A thin track under a comet head sweeps once before the fetch (the intro),
+# and while the info types, a bright caret bar dashes ahead of the text
+# with a slash trail behind it, then vanishes. Every frame self-cleans, so
+# the finished transcript holds only the fetch — no residue anywhere.
+
+INTRO_CELL_MS = 4.0     # sweep speed, per track cell
+FLY_EVERY = 8           # type this many visible chars, then the caret flies
+FLY_CELLS = 4           # how far ahead of the text it dashes
+FLY_FRAME_MS = 6.0      # per frame of the dash
+
+BAR_HEAD = ("\x1b[1m\x1b[38;2;243;246;255m▊\x1b[0m")       # the flying caret
+BAR_SLASH = f"\x1b[38;2;{ACCENT[0]};{ACCENT[1]};{ACCENT[2]}m╱\x1b[0m"
+BAR_TRACK = f"\x1b[38;2;{DIM[0]};{DIM[1]};{DIM[2]}m─\x1b[0m"
+BAR_FILL = f"\x1b[38;2;{ACCENT[0]};{ACCENT[1]};{ACCENT[2]}m━\x1b[0m"
+BAR_COMET = "\x1b[1m\x1b[38;2;243;246;255m█\x1b[0m"
+
+
+def _term_cols() -> int:
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 100
+
+
+def intro_bar(color: bool = True) -> None:
+    """A thin accent bar fills left→right under a comet; erases itself."""
+    if not color or not sys.stdout.isatty():
+        return
+    track = min(max(_term_cols() - 2, 18), 64)
+    try:
+        for k in range(track):
+            row = BAR_FILL * k + BAR_COMET + BAR_TRACK * (track - k - 1)
+            sys.stdout.write("\r\x1b[2K" + row)
+            sys.stdout.flush()
+            time.sleep(INTRO_CELL_MS / 1000.0)
+        time.sleep(0.05)
+        sys.stdout.write("\r\x1b[2K")
+        sys.stdout.flush()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+def _fly_dash() -> None:
+    """The caret shoots FLY_CELLS ahead of the typing, slash trail behind,
+    then everything disappears — cursor back exactly where typing stopped."""
+    try:
+        sys.stdout.write("\x1b[s")                      # anchor at text end
+        for k in range(1, FLY_CELLS + 1):
+            seq = "\x1b[u"
+            if k > 1:
+                seq += f"\x1b[{k - 1}C "                # old caret → gone
+            if k > 2:
+                seq += ("\x1b[u" + f"\x1b[{k - 2}C" + BAR_SLASH)
+            seq += ("\x1b[u" + f"\x1b[{k}C" + BAR_HEAD)
+            sys.stdout.write(seq)
+            sys.stdout.flush()
+            time.sleep(FLY_FRAME_MS / 1000.0)
+        sys.stdout.write("\x1b[u" + " " * FLY_CELLS
+                         + f"\x1b[{FLY_CELLS}D")        # vanish, take the trail
+        sys.stdout.flush()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+def stream(text: str, speed_ms: float = 2.0, color: bool = True,
+           art_rows: int = 0, line_ms: float = 12.0, caret: bool = True) -> None:
+    """The animation: the logo builds row by row, the info types itself —
+    and every FLY_EVERY chars the caret bar flies ahead with a slash trail.
+    Escape runs jump instantly; visible chars tick at speed_ms."""
+    lines = text.split("\n")
+    if not color or not sys.stdout.isatty() or speed_ms <= 0:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return
+    delay = max(0.2, speed_ms) / 1000.0
+    line_wait = max(0.5, line_ms) / 1000.0
+    cols = _term_cols()
+    try:
+        for i, line in enumerate(lines):
+            if i < art_rows:
+                sys.stdout.write(line + ("\n" if i < len(lines) - 1 else ""))
+                sys.stdout.flush()
+                time.sleep(line_wait)
+            else:
+                n = 0
+                for part in ANSI_RE.split(line):
+                    if not part:
+                        continue
+                    if part.startswith("\x1b"):
+                        sys.stdout.write(part)
+                    else:
+                        for ch in part:
+                            sys.stdout.write(ch)
+                            if (caret and n > 2 and n % FLY_EVERY == 0
+                                    and len(line) < cols - 10):
+                                _fly_dash()
+                            sys.stdout.flush()
+                            time.sleep(delay)
+                            n += 1
+                if i < len(lines) - 1:
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+# --------------------------------------------------------------------- faces
+def set_image(rest: list[str]) -> int:
+    args = [a for a in rest if not a.startswith("-")]
+    if not args:
+        print("usage: ourfetch set-image <image.png>")
+        return 1
+    src = Path(os.path.expanduser(args[0]))
+    if not src.is_file():
+        print(f"ourfetch: no such file: {src}")
+        return 1
+    os.makedirs(config_dir(), exist_ok=True)
+    dest = Path(config_dir()) / "image.png"
+    try:
+        if src.suffix.lower() == ".png":
+            shutil.copyfile(src, dest)
+        else:
+            from PIL import Image
+            Image.open(src).convert("RGBA").save(dest)
+    except Exception as err:
+        print(f"ourfetch: couldn't use {src.name} — {err}")
+        return 1
+    cfg = load_config()
+    cfg["image"] = str(dest)
+    save_config(cfg)
+    print(f"ourfetch: logo set → {dest}  (clear-image undoes)")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        os.system("")            # flips on ANSI codes in the windows console
+    try:                         # logos carry box/block glyphs — need utf-8
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    flat = list(sys.argv[1:] if argv is None else argv)
+    if flat and flat[0] == "set-image":
+        return set_image(flat[1:])
+    if flat and flat[0] == "clear-image":
+        cfg = load_config()
+        cfg["image"] = ""
+        save_config(cfg)
+        print("ourfetch: image cleared — automatic OS logo from now on")
+        return 0
+    if flat and flat[0] == "logos":
+        for key in LOGOS:
+            print(key)
+        print(f"{len(LOGOS)} logos — `ourfetch logo <id>` previews one")
+        return 0
+    if flat and flat[0] == "logo":
+        if len(flat) < 2:
+            print("usage: ourfetch logo <id>  (see `ourfetch logos`)")
+            return 1
+        print("\n".join(logo_for(flat[1])))
+        return 0
+
+    p = argparse.ArgumentParser(
+        prog="ourfetch",
+        description="info + OS logo (or your image), typed fast — "
+                    "every terminal, every OS")
+    p.add_argument("--no-anim", action="store_true", help="print instantly")
+    p.add_argument("--cols", type=int, help="logo width in characters")
+    p.add_argument("--speed", type=float, help="typing ms per char (default 2)")
+    p.add_argument("--no-intro", action="store_true", help="skip the intro bar")
+    p.add_argument("--no-caret", action="store_true", help="skip the caret")
+    p.add_argument("--logo", metavar="ID", dest="logo",
+                   help="force a logo id (see `ourfetch logos`)")
+    p.add_argument("--bg", metavar="R,G,B", dest="bg",
+                   help="blend color for images — your terminal's background")
+    args = p.parse_args(flat)
+
+    cfg = load_config()
+    cols = int(args.cols or cfg.get("cols") or 36)
+    speed = float(args.speed if args.speed is not None else cfg.get("speed", 2.0))
+    animate = bool(cfg.get("anim", True)) and not args.no_anim
+    if args.no_intro:
+        cfg["intro"] = False
+    if args.no_caret:
+        cfg["caret"] = False
+    color = not bool(os.environ.get("NO_COLOR"))
+
+    bg = BG                                      # images blend against this
+    raw_bg = args.bg or cfg.get("bg") or ""
+    if raw_bg:
+        try:
+            parts = [int(x) for x in re.split(r"[ ,]+", str(raw_bg).strip())]
+            if len(parts) == 3:
+                bg = tuple(max(0, min(255, v)) for v in parts)
+        except ValueError:
+            bg = BG
+
+    art: list[str] | None = None
+    img = image_path()
+    if img:
+        try:
+            art = image_to_ansi(str(img), cols, bg)
+        except Exception as err:
+            print(f"ourfetch: image failed ({err}) — OS logo instead",
+                  file=sys.stderr)
+            art = None
+    if art is None:
+        key = args.logo.strip().lower() if args.logo else os_id()
+        art = logo_for(key)
+
+    rows = gather()
+    text = compose(art, info_lines(rows, color, brand_color(os_id())),
+                   colors_line(color), color)
+    if animate:
+        if bool(cfg.get("intro", True)):
+            intro_bar(color)
+        stream(text, speed, color, art_rows=len(art),
+               line_ms=float(cfg.get("line_delay", 12)),
+               caret=bool(cfg.get("caret", True)))
+    else:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    return 0
