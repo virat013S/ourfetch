@@ -527,13 +527,17 @@ TOKEN_COLORS = {
 
 
 # ------------------------------------------------------------------ config
-def config_dir() -> str:
-    # unix (linux + macOS) honors XDG; windows uses %APPDATA%\ourfetch
+def _config_base() -> str:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return xdg                                # honored everywhere, even tests
     if sys.platform == "win32":
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "ourfetch")
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "ourfetch")
+        return os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.expanduser("~/.config")
+
+
+def config_dir() -> str:
+    return os.path.join(_config_base(), "ourfetch")
 
 
 def config_path() -> str:
@@ -545,9 +549,7 @@ def _adopt_vitro(merged: dict) -> bool:
 
     Copy vitro's fetch.json (and any remembered image) into our own config
     dir so upgrading to the standalone keeps every knob."""
-    if sys.platform == "win32":
-        return False
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    base = _config_base()
     src_cfg = os.path.join(base, "vitro", "fetch.json")
     try:
         with open(src_cfg, encoding="utf-8") as f:
@@ -791,8 +793,9 @@ def mem_str() -> str:
 
 def disk_str() -> str:
     try:
-        # shutil.disk_usage works from linux to Windows without /proc
-        st = shutil.disk_usage("/")
+        # shutil.disk_usage works from linux to Windows without /proc;
+        # os.sep resolves to the current drive's root on Windows
+        st = shutil.disk_usage(os.path.abspath(os.sep))
         used, total = st.used, st.total
         pct = (used / total * 100) if total else 0
         return f"{used / 2 ** 30:.0f} / {total / 2 ** 30:.0f} GiB ({pct:.0f}%)"
